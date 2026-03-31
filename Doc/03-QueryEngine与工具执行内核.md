@@ -105,3 +105,109 @@
 - 工具上下文统一协议：`src/Tool.ts`（`ToolUseContext`）
 - 串并行工具调度：`src/services/tools/toolOrchestration.ts`（`runTools()`）
 - 流式执行与取消语义：`src/services/tools/StreamingToolExecutor.ts`
+
+## 10. 工具通信详细链路（API Streaming 报文级）
+
+> 本节聚焦“本地 CLI ↔ Anthropic Messages API”这条主链路；远程 CCR 会话链路见 `05`。
+
+### 10.1 请求封装（发送前）
+
+在 `services/api/claude.ts` 的 `paramsFromContext()` 中，最终组装 `anthropic.beta.messages.create({... stream: true })` 参数，核心字段如下：
+
+- `model`：模型标识（会先归一化）。
+- `messages`：历史消息数组（已做 `normalizeMessagesForAPI`、tool pairing 修复、媒体裁剪）。
+- `system`：系统提示块数组（含 attribution/header/feature 指令）。
+- `tools`：工具 schema 列表（由 `toolToAPISchema()` 生成；可带 `defer_loading`）。
+- `tool_choice`：工具选择策略（auto/specific）。
+- `max_tokens`：本轮最大输出 token。
+- `thinking`：思考配置（`adaptive` 或 `enabled + budget_tokens`）。
+- `metadata`：请求归因信息（`device_id/account_uuid/session_id` 等）。
+- `betas`：beta header 列表（fast mode/context mgmt/tool search 等）。
+- `output_config`：结构化输出、effort、task budget 等扩展配置。
+- `context_management`：上下文管理策略（满足 beta 条件时注入）。
+
+### 10.2 流式响应解析（事件到消息）
+
+`queryModel()` 使用 `for await (const part of stream)` 按事件解析，关键事件与处理：
+
+1. `message_start`  
+   - 初始化 `partialMessage` 与 usage 基线。
+2. `content_block_start`  
+   - 创建 block 容器：`text/thinking/tool_use/server_tool_use`。
+3. `content_block_delta`  
+   - 追加增量：  
+     - `text_delta` → 文本拼接  
+     - `thinking_delta/signature_delta` → thinking 拼接与签名  
+     - `input_json_delta` → 工具输入 JSON 片段拼接
+4. `content_block_stop`  
+   - 将完整 block 正规化为内部 `AssistantMessage` 并 `yield`。
+5. `message_delta`  
+   - 回填最终 `usage` 与 `stop_reason`（例如 `tool_use`、`end_turn`、`max_tokens`）。
+6. `message_stop`  
+   - 该条 assistant 消息流结束。
+
+### 10.3 `tool_use` → 本地工具执行 → `tool_result` 回填
+
+主循环位于 `query.ts`：
+
+1. 从 assistant 内容块提取 `tool_use`（含 `id/name/input`）。
+2. 交给 `StreamingToolExecutor` / `toolOrchestration.runTools()` 执行。
+3. 执行结果包装为 user 消息中的 `tool_result` block，并放回会话：
+   - 关键绑定字段：`tool_use_id`（必须与上一步 `tool_use.id` 一致）。
+4. 触发下一轮 API 调用，模型继续消费 `tool_result` 并生成后续回答/新工具调用。
+
+### 10.4 关键报文示例（简化）
+
+**A. 请求报文（节选）**
+
+```json
+{
+  "model": "claude-sonnet-4-5",
+  "messages": [
+    { "role": "user", "content": "请读取 package/package.json 并总结 scripts" }
+  ],
+  "system": [{ "type": "text", "text": "<system prompt...>" }],
+  "tools": [
+    { "name": "Read", "description": "...", "input_schema": { "type": "object" } }
+  ],
+  "max_tokens": 32000,
+  "stream": true
+}
+```
+
+**B. 流式事件（assistant 发起工具）**
+
+```json
+{ "type": "message_start", "message": { "id": "msg_x", "usage": { "input_tokens": 1234, "output_tokens": 0 } } }
+{ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {} } }
+{ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"file_path\":\"package/package.json\"}" } }
+{ "type": "content_block_stop", "index": 0 }
+{ "type": "message_delta", "delta": { "stop_reason": "tool_use" }, "usage": { "output_tokens": 87 } }
+{ "type": "message_stop" }
+```
+
+**C. 回填 `tool_result`（下一次请求中的 user 消息）**
+
+> 说明： 以下 `content` 为简化示例文本，实际返回格式取决于具体工具实现（可能为结构化 JSON、文本片段或混合内容块）。
+
+```json
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "tool_result",
+      "tool_use_id": "toolu_1",
+      "content": "读取成功：{ \"scripts\": { \"prepare\": \"...\" } }",
+      "is_error": false
+    }
+  ]
+}
+```
+
+### 10.5 字段语义速查
+
+- `tool_use.id`： 本次工具调用唯一 ID。  
+- `tool_result.tool_use_id`： 关联回哪一次 `tool_use`。  
+- `stop_reason`： 本轮停止原因，常见 `tool_use/end_turn/max_tokens`。  
+- `usage`： token 计量（输入/输出/缓存读写），在 `message_delta` 阶段最终稳定。  
+- `request_id`： HTTP 请求维度 ID（从 SDK response 读取，用于追踪与诊断）。
