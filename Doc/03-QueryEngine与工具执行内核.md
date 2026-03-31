@@ -253,3 +253,119 @@ stream 长时间无 chunk
 
 - 如果流式执行中断，执行器会补齐/生成必要的工具结果占位，避免 `tool_use` 与 `tool_result` 失配。
 - 这是保证后续轮次报文一致性的关键保护。
+
+### 10.8 请求报文字段“全量清单”（按当前代码路径）
+
+> 口径说明：以下以 `paramsFromContext()` 实际构造的请求体为准，分为“恒定字段”和“条件字段”。
+
+#### A. 恒定字段（每次请求都会出现）
+
+- `model`：`normalizeModelStringForAPI(options.model)` 归一化后的模型名。
+- `messages`：经 cache breakpoint/compact 处理后的消息数组。
+- `system`：系统消息块数组。
+- `tools`：工具 schema 数组。
+- `tool_choice`：工具策略。
+- `metadata`：`getAPIMetadata()` 返回值。
+- `max_tokens`：本轮最大输出 token。
+
+#### B. 条件字段（满足条件才注入）
+
+1. `betas`  
+   - 条件：`useBetas` 为真。  
+   - 来源：基础 beta + 动态追加（如 1M/fast/context mgmt/structured output 等）。
+
+2. `thinking`  
+   - 条件：thinking 未禁用且模型支持。  
+   - 形态：
+     - `{ type: "adaptive" }`
+     - `{ type: "enabled", budget_tokens: number }`
+
+3. `temperature`  
+   - 条件：仅在 thinking 关闭时发送（thinking 开启时依赖 API 默认 `1`）。
+
+4. `context_management`  
+   - 条件：`getAPIContextManagement()` 有返回，且 beta 开关满足并包含 `CONTEXT_MANAGEMENT_BETA_HEADER`。
+
+5. `output_config`  
+   - 条件：`outputConfig` 非空。  
+   - 可能包含：
+     - `effort`
+     - `task_budget`
+     - `format`（structured outputs）
+     - 以及 provider extra body 里的兼容字段。
+
+6. `speed`  
+   - 条件：fast mode 可用且本次 retryContext 允许。
+
+7. provider 额外字段（`...extraBodyParams`）  
+   - 条件：provider（例如 bedrock）路径下由 `getExtraBodyParams()` 返回。
+
+### 10.9 流式事件字段“全量清单”（按解析分支）
+
+> 口径说明：这里列的是 `queryModel()` 显式消费/依赖的字段全集，而不是 SDK 原始事件 schema 的理论全集。
+
+#### 1) `message_start`
+
+- `type`
+- `message`（至少消费到）：
+  - `usage`
+  - 其余字段透传进入 `partialMessage`
+- （internal）`research` 可能出现并被记录
+
+#### 2) `content_block_start`
+
+- `type`
+- `index`
+- `content_block`（按 block type 分支）：
+  - `tool_use`：`id/name/input`（其中 `input` 在本地重置为空字符串再拼接）
+  - `server_tool_use`：`id/name/input`（同样走增量拼接）
+  - `text`：`text`（起始值被置空，防重复）
+  - `thinking`：`thinking/signature`（均初始化为空字符串）
+  - `connector_text`（feature 打开时）：走专门 delta 分支
+  - 其他 block：按原样浅拷贝保留
+
+#### 3) `content_block_delta`
+
+- `type`
+- `index`
+- `delta`：
+  - `input_json_delta.partial_json`
+  - `text_delta.text`
+  - `thinking_delta.thinking`
+  - `signature_delta.signature`
+  - `connector_text_delta.connector_text`（feature 条件）
+  - `citations_delta`（当前分支仅识别，未落地处理）
+- （internal）`research` 可能出现并覆盖
+
+#### 4) `content_block_stop`
+
+- `type`
+- `index`
+- 行为：把 `contentBlocks[index]` 归一化后构造成 `AssistantMessage` 并立刻 `yield`
+
+#### 5) `message_delta`
+
+- `type`
+- `delta.stop_reason`
+- `usage`
+- （internal）`research`
+- 行为：回填最近一条已 yield 的 assistant 消息：
+  - `message.usage = usage`
+  - `message.stop_reason = stop_reason`
+
+#### 6) `message_stop`
+
+- `type`
+- 行为：单条 assistant 消息流结束标记
+
+#### 7) 内部二次转发事件（SDK 层可见）
+
+每个原始 `part` 还会被包装为：
+
+```json
+{
+  "type": "stream_event",
+  "event": "<raw stream part>",
+  "ttftMs": "<only for message_start>"
+}
+```
