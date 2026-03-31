@@ -188,7 +188,7 @@
 
 **C. 回填 `tool_result`（下一次请求中的 user 消息）**
 
-> 说明： 以下 `content` 为简化示例文本，实际返回格式取决于具体工具实现（可能为结构化 JSON、文本片段或混合内容块）。
+**说明**：以下 `content` 为示例，实际格式取决于工具实现（可能为结构化 JSON、文本片段或混合内容块）。
 
 ```json
 {
@@ -197,7 +197,7 @@
     {
       "type": "tool_result",
       "tool_use_id": "toolu_1",
-      "content": "读取成功：{ \"scripts\": { \"prepare\": \"...\" } }",
+      "content": "Read succeeded: { \"scripts\": { \"prepare\": \"...\" } }",
       "is_error": false
     }
   ]
@@ -211,3 +211,45 @@
 - `stop_reason`： 本轮停止原因，常见 `tool_use/end_turn/max_tokens`。  
 - `usage`： token 计量（输入/输出/缓存读写），在 `message_delta` 阶段最终稳定。  
 - `request_id`： HTTP 请求维度 ID（从 SDK response 读取，用于追踪与诊断）。
+
+### 10.6 解析细节补充（避免常见误读）
+
+1. **`content_block_stop` 先产出消息，`message_delta` 再回填最终统计**  
+   - 代码中 assistant 消息在 `content_block_stop` 即被构造并 `yield`。  
+   - 但 `usage/stop_reason` 的最终值在后续 `message_delta` 才写回。  
+   - 因此若只看首个 yield，可能会误认为 `usage.output_tokens=0` 或 `stop_reason=null`。
+
+2. **工具输入不是一次性 JSON，而是 `input_json_delta` 片段拼接**  
+   - `tool_use.input` 初始为空字符串，随后连续拼接 `partial_json`。  
+   - 这解释了为什么抓包中经常看到多段 `content_block_delta` 才形成完整参数。
+
+3. **每个原始流事件都会再包装成内部 `stream_event` 转发**  
+   - 即除了 assistant/user/system 消息外，还会看到 `type='stream_event'` 的透传事件。  
+   - 这层转发用于 UI 实时渲染、诊断与 SDK 消费。
+
+### 10.7 异常链路与报文影响（查漏补缺）
+
+#### A. Streaming 卡住（watchdog）→ 非流式回退
+
+```text
+stream 长时间无 chunk
+  -> watchdog 触发（streamIdleAborted=true）
+  -> 记录 tengu_streaming_fallback_to_non_streaming
+  -> executeNonStreamingRequest()
+  -> 产出完整 assistant message（非 stream）
+```
+
+报文含义影响：
+
+- 你可能看到同一轮先有部分 stream 事件，随后出现一次完整 non-streaming 结果。
+- 这是容错路径，不是重复调用工具（代码里有对应防重与丢弃逻辑）。
+
+#### B. `stop_reason=max_tokens` / `model_context_window_exceeded`
+
+- 不直接结束为“正常成功”，而会额外生成 API error message（`apiError=max_output_tokens`），
+  供上层进入恢复/续写逻辑。
+
+#### C. 中断（用户 ESC 或 abort signal）
+
+- 如果流式执行中断，执行器会补齐/生成必要的工具结果占位，避免 `tool_use` 与 `tool_result` 失配。
+- 这是保证后续轮次报文一致性的关键保护。
