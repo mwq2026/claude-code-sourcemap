@@ -96,3 +96,12 @@
 4. **中断语义明确**
 5. **feature gate 隔离试验逻辑**（如 HISTORY_SNIP）
 
+## 9. 二次审核补充（证据锚点）
+
+为避免“只讲结论不讲依据”，本卷关键结论对应的源码锚点如下：
+
+- 会话级封装与状态持有：`src/QueryEngine.ts`（`QueryEngineConfig`、`submitMessage()`）
+- 查询主循环与 token/compact 处理：`src/query.ts`（`query()` 与 compact/recovery 相关逻辑）
+- 工具上下文统一协议：`src/Tool.ts`（`ToolUseContext`）
+- 串并行工具调度：`src/services/tools/toolOrchestration.ts`（`runTools()`）
+- 流式执行与取消语义：`src/services/tools/StreamingToolExecutor.ts`
